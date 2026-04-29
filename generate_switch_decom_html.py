@@ -53,6 +53,35 @@ for col in ['ANNUAL_POWER_SAVINGS','TOTAL_ACTUAL_SAVINGS_PRTXDIS','COPPER_FOOTAG
     switch_df[col] = pd.to_numeric(switch_df[col], errors='coerce')
 print(f"  {len(switch_df):,} non-SWIFT switches")
 
+# ─── Service class CASE (Voice / Data / Mixed / Unknown) ─────────────────────
+_svc = """
+    CASE
+      WHEN UPPER(BILLING_USOC_DESC) LIKE '%VOICE/DATA%'
+        OR UPPER(BILLING_USOC_DESC) LIKE '%VOICE DATA%'  THEN 'Mixed'
+      WHEN UPPER(BILLING_USOC_DESC) LIKE '%CENTREX%'
+        OR UPPER(BILLING_USOC_DESC) LIKE '%CNTRX%'
+        OR UPPER(BILLING_USOC_DESC) LIKE '% CTX %'
+        OR UPPER(BILLING_USOC_DESC) LIKE 'CTX %'
+        OR UPPER(BILLING_USOC_DESC) LIKE '%CUSTOPAK%'
+        OR UPPER(BILLING_USOC_DESC) LIKE '%CUST OPAK%'
+        OR UPPER(BILLING_USOC_DESC) LIKE '%CENTRANET%'
+        OR UPPER(BILLING_USOC_DESC) LIKE '%ISDN%'
+        OR UPPER(BILLING_USOC_DESC) LIKE '%INTELLILINQ%'
+        OR UPPER(BILLING_USOC_DESC) LIKE '%VOICE%'       THEN 'Voice'
+      WHEN UPPER(BILLING_USOC_DESC) LIKE '%DS1%'
+        OR UPPER(BILLING_USOC_DESC) LIKE '%DS3%'
+        OR UPPER(BILLING_USOC_DESC) LIKE '%1.544%'
+        OR UPPER(BILLING_USOC_DESC) LIKE '%44.736%'
+        OR UPPER(BILLING_USOC_DESC) LIKE '%DSL%'
+        OR UPPER(BILLING_USOC_DESC) LIKE '%ADSL%'
+        OR UPPER(BILLING_USOC_DESC) LIKE '% DATA%'
+        OR UPPER(BILLING_USOC_DESC) LIKE 'DATA %'
+        OR UPPER(BILLING_USOC_DESC) LIKE '%HIGH CAPACITY%'
+        OR UPPER(BILLING_USOC_DESC) LIKE '%PRIVATE LINE%' THEN 'Data'
+      ELSE 'Unknown'
+    END
+"""
+
 # ─── Circuit aggregations ─────────────────────────────────────────────────────
 print("Loading circuit data (may take ~60s)...")
 circuit_df = pd.read_sql(f"""
@@ -67,19 +96,28 @@ circuit_df = pd.read_sql(f"""
         SUM(CASE WHEN COPPER_FIBER_IND='C'   THEN 1 ELSE 0 END) AS COPPER,
         SUM(CASE WHEN COPPER_FIBER_IND='F'   THEN 1 ELSE 0 END) AS FIBER,
         MIN(DECOM_WAVE_ID)      AS MIN_WAVE,
-        MAX(DECOM_WAVE_ID)      AS MAX_WAVE
+        MAX(DECOM_WAVE_ID)      AS MAX_WAVE,
+        SUM(CASE WHEN ({_svc}) = 'Voice'   THEN 1 ELSE 0 END) AS VOICE_COUNT,
+        SUM(CASE WHEN ({_svc}) = 'Data'    THEN 1 ELSE 0 END) AS DATA_COUNT,
+        SUM(CASE WHEN ({_svc}) = 'Mixed'   THEN 1 ELSE 0 END) AS MIXED_COUNT
     FROM VNADSPRD.NT_DECOM_CIRCUITS_SOURCE
     WHERE CLLI_CD IS NOT NULL
     AND UPPER(CLLI_CD) NOT IN ({swift_sql})
     GROUP BY CLLI_CD
 """, conn)
 circuit_df['CLLI_CD'] = circuit_df['CLLI_CD'].str.upper().str.strip()
-total_ckts = int(circuit_df['TOTAL'].sum())
-total_done = int(circuit_df['COMPLETED'].sum())
-total_prog = int(circuit_df['IN_PROGRESS'].sum())
-total_pend = total_ckts - total_done - total_prog
-pct_done   = round(total_done / total_ckts * 100, 1) if total_ckts else 0
-print(f"  {len(circuit_df):,} CLLIs | {total_ckts:,} circuits | {pct_done}% complete")
+for col in ['VOICE_COUNT','DATA_COUNT','MIXED_COUNT']:
+    circuit_df[col] = pd.to_numeric(circuit_df[col], errors='coerce').fillna(0).astype(int)
+total_ckts    = int(circuit_df['TOTAL'].sum())
+total_done    = int(circuit_df['COMPLETED'].sum())
+total_prog    = int(circuit_df['IN_PROGRESS'].sum())
+total_pend    = total_ckts - total_done - total_prog
+pct_done      = round(total_done / total_ckts * 100, 1) if total_ckts else 0
+total_voice   = int(circuit_df['VOICE_COUNT'].sum())
+total_data    = int(circuit_df['DATA_COUNT'].sum())
+total_mixed   = int(circuit_df['MIXED_COUNT'].sum())
+total_unknown = total_ckts - total_voice - total_data - total_mixed
+print(f"  {len(circuit_df):,} CLLIs | {total_ckts:,} circuits | {pct_done}% complete | Voice={total_voice:,} Data={total_data:,} Mixed={total_mixed:,}")
 
 # ─── Wave summary ─────────────────────────────────────────────────────────────
 print("Wave summary...")
@@ -364,12 +402,16 @@ DATA = {
         "pct_complete":   pct_done,
         "swift_excluded": len(swift_set),
         "as_of":          TODAY,
+        "voice":          total_voice,
+        "data":           total_data,
+        "mixed":          total_mixed,
+        "svc_unknown":    total_unknown,
     },
     "circuits": df_to_cols(
         merged.fillna("").sort_values("TOTAL", ascending=False),
         ["CLLI_CD","WC_NAME","REGION","STATE","TOTAL","COMPLETED","IN_PROGRESS",
          "COPPER","FIBER","MIN_WAVE","MAX_WAVE","SWITCH_TYPE","SWITCH_STATUS",
-         "SWITCH_CUTOVER_DATE","CUTOVER_YEAR"]
+         "SWITCH_CUTOVER_DATE","CUTOVER_YEAR","VOICE_COUNT","DATA_COUNT","MIXED_COUNT"]
     ),
     "switches": df_to_cols(
         switch_df.fillna("").sort_values("CLLI"),
@@ -558,6 +600,22 @@ tr:hover td{background:#f8f9fa}
     <div class="card"><div class="card-title">Copper vs Fiber Circuits</div><div id="chart-cf-donut" style="height:280px"></div></div>
     <div class="card"><div class="card-title">Circuits by Sales Segment</div><div id="chart-seg-bar" style="height:280px"></div></div>
   </div>
+  <div class="row2">
+    <div class="card">
+      <div class="card-title">Voice vs Data Circuit Mix</div>
+      <div id="chart-svc-donut" style="height:280px"></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Voice vs Data — Program Totals</div>
+      <div class="kpi-row" style="grid-template-columns:repeat(4,1fr);margin-top:20px">
+        <div class="kpi c-blue"><div class="kpi-label">Voice Circuits</div><div class="kpi-value" id="svc-kpi-voice">—</div><div class="kpi-sub" id="svc-kpi-voice-pct">—</div></div>
+        <div class="kpi c-orange"><div class="kpi-label">Data Circuits</div><div class="kpi-value" id="svc-kpi-data">—</div><div class="kpi-sub" id="svc-kpi-data-pct">—</div></div>
+        <div class="kpi c-purple"><div class="kpi-label">Mixed</div><div class="kpi-value" id="svc-kpi-mixed">—</div><div class="kpi-sub" id="svc-kpi-mixed-pct">—</div></div>
+        <div class="kpi c-green"><div class="kpi-label">Unknown / Other</div><div class="kpi-value" id="svc-kpi-unk">—</div><div class="kpi-sub" id="svc-kpi-unk-pct">—</div></div>
+      </div>
+      <div style="font-size:.75rem;color:#adb5bd;margin-top:16px;padding:0 8px">Classification based on BILLING_USOC_DESC. Voice includes Centrex, Custopak, ISDN, IntelliLinQ. Data includes DS1/DS3, DSL, Private Line Data, High Capacity.</div>
+    </div>
+  </div>
 </div>
 
 <!-- SWITCH INVENTORY TAB -->
@@ -644,6 +702,12 @@ tr:hover td{background:#f8f9fa}
     <div class="kpi c-green"><div class="kpi-label">Completed</div><div class="kpi-value" id="ckt-kpi-done">—</div></div>
     <div class="kpi c-red"><div class="kpi-label">Remaining</div><div class="kpi-value" id="ckt-kpi-rem">—</div></div>
   </div>
+  <div class="kpi-row kpi-row-4" style="margin-bottom:14px">
+    <div class="kpi c-blue"><div class="kpi-label">Voice Circuits</div><div class="kpi-value" id="ckt-kpi-voice">—</div><div class="kpi-sub" id="ckt-kpi-voice-pct">of filtered total</div></div>
+    <div class="kpi c-orange"><div class="kpi-label">Data Circuits</div><div class="kpi-value" id="ckt-kpi-data">—</div><div class="kpi-sub" id="ckt-kpi-data-pct">of filtered total</div></div>
+    <div class="kpi c-purple"><div class="kpi-label">Mixed</div><div class="kpi-value" id="ckt-kpi-mixed">—</div><div class="kpi-sub" id="ckt-kpi-mixed-pct">of filtered total</div></div>
+    <div class="kpi c-green"><div class="kpi-label">Unknown / Other</div><div class="kpi-value" id="ckt-kpi-svcunk">—</div><div class="kpi-sub" id="ckt-kpi-svcunk-pct">of filtered total</div></div>
+  </div>
   <div class="row2" id="cktype-charts" style="margin-bottom:16px">
     <div class="card"><div class="card-title" id="cktype-dist-title">Circuit Type Distribution</div><div id="chart-cktype-donut" style="height:320px"></div></div>
     <div class="card"><div class="card-title">Completion Rate by Circuit Type</div><div id="chart-cktype-bar" style="height:320px"></div></div>
@@ -663,7 +727,9 @@ tr:hover td{background:#f8f9fa}
         <th onclick="sortTable('ckt-tbl',8)">% Done</th>
         <th onclick="sortTable('ckt-tbl',9)">Switch Type</th>
         <th onclick="sortTable('ckt-tbl',10)">Wave(s)</th>
-        <th onclick="sortTable('ckt-tbl',11)">TIRKS</th>
+        <th onclick="sortTable('ckt-tbl',11)">Voice</th>
+        <th onclick="sortTable('ckt-tbl',12)">Data</th>
+        <th onclick="sortTable('ckt-tbl',13)">TIRKS</th>
       </tr></thead>
       <tbody id="ckt-tbl-body"></tbody>
     </table></div>
@@ -1174,6 +1240,29 @@ function initSummary(){
     hovertemplate:'%{y}: %{x:,}<extra></extra>'
   }], {margin:{t:10,b:40,l:180,r:60},
        xaxis:{tickformat:','}, yaxis:{automargin:true}}, {responsive:true, displayModeBar:false});
+
+  // Voice vs Data donut
+  const voice = S.voice, data_ = S.data, mixed = S.mixed, unk = S.svc_unknown;
+  const tot   = S.total_circuits;
+  Plotly.newPlot('chart-svc-donut', [{
+    type:'pie', hole:.45,
+    labels:['Voice','Data','Mixed','Unknown/Other'],
+    values:[voice, data_, mixed, unk],
+    marker:{colors:['#0d6efd','#fd7e14','#6f42c1','#adb5bd']},
+    textinfo:'label+percent',
+    hovertemplate:'%{label}: %{value:,} circuits<extra></extra>'
+  }], {margin:{t:10,b:10,l:10,r:10}, showlegend:true, legend:{orientation:'h',y:-0.12}},
+  {responsive:true, displayModeBar:false});
+
+  // Voice/Data KPI cards
+  document.getElementById('svc-kpi-voice').textContent     = fmt(voice);
+  document.getElementById('svc-kpi-voice-pct').textContent = pct(voice, tot) + ' of total';
+  document.getElementById('svc-kpi-data').textContent      = fmt(data_);
+  document.getElementById('svc-kpi-data-pct').textContent  = pct(data_, tot) + ' of total';
+  document.getElementById('svc-kpi-mixed').textContent     = fmt(mixed);
+  document.getElementById('svc-kpi-mixed-pct').textContent = pct(mixed, tot) + ' of total';
+  document.getElementById('svc-kpi-unk').textContent       = fmt(unk);
+  document.getElementById('svc-kpi-unk-pct').textContent   = pct(unk, tot) + ' of total';
 }
 
 // ── Switch tab CLLI lookup ────────────────────────────────────────────────────
@@ -1351,7 +1440,7 @@ function renderCktTable(){
   const fSwtype = document.getElementById('ckt-filter-swtype').value;
   const fSearch = document.getElementById('ckt-search').value.trim().toUpperCase();
   const fTirks  = document.getElementById('ckt-filter-tirks').value;
-  let filtCllis=0, filtTot=0, filtDone=0, filtRem=0;
+  let filtCllis=0, filtTot=0, filtDone=0, filtRem=0, filtVoice=0, filtData=0, filtMixed=0;
   const tbody = document.getElementById('ckt-tbl-body');
   let html = '';
   for(let i=0; i<CK.CLLI_CD.length; i++){
@@ -1361,15 +1450,21 @@ function renderCktTable(){
     if(fSearch && !(CK.CLLI_CD[i]||'').includes(fSearch) && !(CK.WC_NAME[i]||'').toUpperCase().includes(fSearch)) continue;
     if(fTirks === 'Y' && !TIRKS_CLLIS.has(CK.CLLI_CD[i])) continue;
     if(fTirks === 'N' &&  TIRKS_CLLIS.has(CK.CLLI_CD[i])) continue;
-    const tot  = CK.TOTAL[i]||0;
-    const done = CK.COMPLETED[i]||0;
-    const prog = CK.IN_PROGRESS[i]||0;
-    const rem  = tot-done-prog;
-    const pp   = tot ? (done/tot*100) : 0;
+    const tot   = CK.TOTAL[i]||0;
+    const done  = CK.COMPLETED[i]||0;
+    const prog  = CK.IN_PROGRESS[i]||0;
+    const rem   = tot-done-prog;
+    const pp    = tot ? (done/tot*100) : 0;
+    const vc    = CK.VOICE_COUNT[i]||0;
+    const dc    = CK.DATA_COUNT[i]||0;
+    const mc    = CK.MIXED_COUNT[i]||0;
     const waveStr = (CK.MIN_WAVE[i]&&CK.MAX_WAVE[i])
       ? (CK.MIN_WAVE[i]===CK.MAX_WAVE[i] ? CK.MIN_WAVE[i] : CK.MIN_WAVE[i]+'-'+CK.MAX_WAVE[i])
       : '—';
     filtCllis++; filtTot+=tot; filtDone+=done; filtRem+=rem;
+    filtVoice+=vc; filtData+=dc; filtMixed+=mc;
+    const vcPct = tot ? (vc/tot*100).toFixed(0) : 0;
+    const dcPct = tot ? (dc/tot*100).toFixed(0) : 0;
     html += '<tr onclick="lookupCLLI(this.dataset.clli)" data-clli="'+CK.CLLI_CD[i]+'" style="cursor:pointer">'
       +'<td style="color:#0d6efd;font-weight:600;text-decoration:underline">'+CK.CLLI_CD[i]+'</td>'
       +'<td>'+CK.WC_NAME[i]+'</td>'
@@ -1386,14 +1481,27 @@ function renderCktTable(){
         +'</div></td>'
       +'<td>'+(CK.SWITCH_TYPE[i]||'—')+'</td>'
       +'<td>'+waveStr+'</td>'
+      +'<td data-val="'+vc+'"><span style="color:#0d6efd;font-weight:600">'+fmt(vc)+'</span>'
+        +(tot?'<span style="font-size:.72rem;color:#6c757d"> ('+vcPct+'%)</span>':'')+'</td>'
+      +'<td data-val="'+dc+'"><span style="color:#fd7e14;font-weight:600">'+fmt(dc)+'</span>'
+        +(tot?'<span style="font-size:.72rem;color:#6c757d"> ('+dcPct+'%)</span>':'')+'</td>'
       +'<td>'+tirksBadge(CK.CLLI_CD[i])+'</td>'
       +'</tr>';
   }
-  tbody.innerHTML = html || '<tr><td colspan="12" style="text-align:center;color:#adb5bd;padding:20px">No records match filters</td></tr>';
+  tbody.innerHTML = html || '<tr><td colspan="14" style="text-align:center;color:#adb5bd;padding:20px">No records match filters</td></tr>';
   document.getElementById('ckt-kpi-cllis').textContent = fmt(filtCllis);
   document.getElementById('ckt-kpi-tot').textContent   = fmt(filtTot);
   document.getElementById('ckt-kpi-done').textContent  = fmt(filtDone);
   document.getElementById('ckt-kpi-rem').textContent   = fmt(filtRem);
+  const filtUnk = filtTot - filtVoice - filtData - filtMixed;
+  document.getElementById('ckt-kpi-voice').textContent     = fmt(filtVoice);
+  document.getElementById('ckt-kpi-voice-pct').textContent = pct(filtVoice, filtTot) + ' of filtered';
+  document.getElementById('ckt-kpi-data').textContent      = fmt(filtData);
+  document.getElementById('ckt-kpi-data-pct').textContent  = pct(filtData, filtTot) + ' of filtered';
+  document.getElementById('ckt-kpi-mixed').textContent     = fmt(filtMixed);
+  document.getElementById('ckt-kpi-mixed-pct').textContent = pct(filtMixed, filtTot) + ' of filtered';
+  document.getElementById('ckt-kpi-svcunk').textContent     = fmt(filtUnk);
+  document.getElementById('ckt-kpi-svcunk-pct').textContent = pct(filtUnk, filtTot) + ' of filtered';
 }
 
 // ── Init Waves ────────────────────────────────────────────────────────────────
@@ -2082,19 +2190,19 @@ function loadLookupDeps(clli){
   document.getElementById('lookup-dep-clli-label').textContent = clli;
   wrap.style.display = 'block';
 
-  const upstream = DD.UPSTREAM[idx] || '—';
+  const upstream = DD.UPSTREAM[idx] || '';
   const depCount = DD.DEP_COUNT[idx] || 0;
   const depList  = DD.DEP_LIST[idx]  || '';
 
   let html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">';
 
-  // Upstream panel
+  // Upstream panel — use data-dep-clli attribute, attach listeners after
   html += '<div><div style="font-weight:700;font-size:.85rem;color:#495057;margin-bottom:6px">Upstream Switch(es)</div>';
-  if(upstream === '—'){
+  if(!upstream){
     html += '<div style="color:#adb5bd;font-size:.85rem">No upstream dependency recorded</div>';
   } else {
-    upstream.split(',').map(s=>s.trim()).forEach(sw=>{
-      html += '<span style="display:inline-block;background:#e3f2fd;color:#0d6efd;border-radius:4px;padding:3px 10px;margin:2px;font-size:.82rem;font-weight:600;cursor:pointer" onclick="lookupCLLI(\''+sw+'\')">'+sw+'</span>';
+    upstream.split(',').map(s=>s.trim()).filter(Boolean).forEach(sw=>{
+      html += '<span class="dep-nav-link" data-dep-clli="'+sw+'" style="display:inline-block;background:#e3f2fd;color:#0d6efd;border-radius:4px;padding:3px 10px;margin:2px;font-size:.82rem;font-weight:600;cursor:pointer">'+sw+'</span> ';
     });
     html += '<div style="font-size:.75rem;color:#6c757d;margin-top:4px">Click to look up any upstream switch</div>';
   }
@@ -2105,17 +2213,23 @@ function loadLookupDeps(clli){
   if(depCount === 0){
     html += '<div style="color:#adb5bd;font-size:.85rem">No wire centers route through this switch</div>';
   } else {
-    depList.split(',').map(s=>s.trim()).forEach(wc=>{
-      const isDecom = DATA.deps.CLLI.includes(wc);
-      const bg = isDecom ? '#fff3cd' : '#f8f9fa';
-      const co = isDecom ? '#856404' : '#495057';
-      html += '<span style="display:inline-block;background:'+bg+';color:'+co+';border-radius:4px;padding:3px 10px;margin:2px;font-size:.82rem;font-weight:600'+(isDecom?';cursor:pointer\' onclick=\'lookupCLLI("'+wc+'")\'' :'\'')+'">'+wc+(isDecom?' &#9888;':'')+'</span>';
+    depList.split(',').map(s=>s.trim()).filter(Boolean).forEach(wc=>{
+      const isDecom = DD.CLLI.indexOf(wc) !== -1;
+      const bg  = isDecom ? '#fff3cd' : '#f8f9fa';
+      const col = isDecom ? '#856404' : '#495057';
+      const cls = isDecom ? ' dep-nav-link' : '';
+      const cur = isDecom ? ';cursor:pointer' : '';
+      html += '<span class="'+cls+'" data-dep-clli="'+wc+'" style="display:inline-block;background:'+bg+';color:'+col+';border-radius:4px;padding:3px 10px;margin:2px;font-size:.82rem;font-weight:600'+cur+'">'+wc+(isDecom ? ' &#9888;' : '')+'</span> ';
     });
-    html += '<div style="font-size:.75rem;color:#6c757d;margin-top:6px">&#9888; = also a decom switch &nbsp;|&nbsp; These WCs must be rehomed before this switch can be decommissioned</div>';
+    html += '<div style="font-size:.75rem;color:#6c757d;margin-top:6px">&#9888; = also a decom switch &nbsp;|&nbsp; These WCs must be rehomed first</div>';
   }
   html += '</div></div>';
 
   document.getElementById('lookup-dep-body').innerHTML = html;
+  // Attach click handlers via data attribute — no inline onclick quoting needed
+  document.querySelectorAll('#lookup-dep-body .dep-nav-link').forEach(function(el){
+    el.addEventListener('click', function(){ lookupCLLI(el.getAttribute('data-dep-clli')); });
+  });
 }
 
 // ── Lookup Device Inventory ───────────────────────────────────────────────────
