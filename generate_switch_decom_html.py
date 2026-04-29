@@ -269,6 +269,54 @@ total_pwrdown     = int((device_df['DEVICE_POWERED_DOWN'] == 'Y').sum())
 total_pwr_savings = int(device_df['POWER_SAVINGS'].sum())
 print(f"  {total_devices:,} device records across {matched_dev_cllis:,} CLLIs | {total_pwrdown:,} powered down")
 
+# ─── Switch dependency (BAAIS_SWITCH_DEPENDENCY) ─────────────────────────────
+print("Loading switch dependency data...")
+dep_raw = pd.read_sql(
+    "SELECT SWITCH_CLLI, WIRE_CENTER_CLLI FROM VNADSPRD.BAAIS_SWITCH_DEPENDENCY",
+    conn
+)
+dep_raw['SWITCH_CLLI']      = dep_raw['SWITCH_CLLI'].str.upper().str.strip()
+dep_raw['WIRE_CENTER_CLLI'] = dep_raw['WIRE_CENTER_CLLI'].str.upper().str.strip()
+
+decom_cllis = set(switch_df['CLLI'].str.upper())
+
+# Upstream: for each decom CLLI, which switch(es) does it route through?
+upstream_map = (
+    dep_raw[dep_raw['WIRE_CENTER_CLLI'].isin(decom_cllis)]
+    .groupby('WIRE_CENTER_CLLI')['SWITCH_CLLI']
+    .apply(list).to_dict()
+)
+# Dependents: for each decom CLLI acting as a parent switch, which WCs depend on it?
+dep_map = (
+    dep_raw[dep_raw['SWITCH_CLLI'].isin(decom_cllis)]
+    .groupby('SWITCH_CLLI')['WIRE_CENTER_CLLI']
+    .apply(list).to_dict()
+)
+
+dep_rows = []
+for clli in sorted(decom_cllis):
+    up   = upstream_map.get(clli, [])
+    deps = dep_map.get(clli, [])
+    dep_rows.append({
+        'CLLI':           clli,
+        'UPSTREAM':       ', '.join(sorted(set(up))),
+        'UPSTREAM_COUNT': len(set(up)),
+        'DEP_COUNT':      len(deps),
+        'DEP_LIST':       ', '.join(sorted(set(deps))),
+    })
+dep_df = pd.DataFrame(dep_rows)
+
+# Enrich with switch state/region/pct done from merged/risk
+dep_df = dep_df.merge(
+    risk_df[['CLLI','STATE','REGION','SWITCH_TYPE','PCT_DONE','RISK']],
+    on='CLLI', how='left'
+)
+
+dep_switches_with_deps = int((dep_df['DEP_COUNT'] > 0).sum())
+dep_total_wcs          = int(dep_df['DEP_COUNT'].sum())
+dep_max_deps           = int(dep_df['DEP_COUNT'].max())
+print(f"  {dep_switches_with_deps} decom switches have dependents | max={dep_max_deps} | total dep WCs={dep_total_wcs}")
+
 conn.close()
 print("Oracle queries complete.")
 
@@ -372,6 +420,16 @@ DATA = {
         "total_devices":   total_devices,
         "powered_down":    total_pwrdown,
         "power_savings_w": total_pwr_savings,
+    },
+    "deps": df_to_cols(
+        dep_df.fillna("").sort_values("DEP_COUNT", ascending=False),
+        ["CLLI","STATE","REGION","SWITCH_TYPE","PCT_DONE","RISK",
+         "UPSTREAM","UPSTREAM_COUNT","DEP_COUNT","DEP_LIST"]
+    ),
+    "dep_summary": {
+        "switches_with_deps": dep_switches_with_deps,
+        "total_dep_wcs":      dep_total_wcs,
+        "max_deps":           dep_max_deps,
     },
 }
 
@@ -479,6 +537,7 @@ tr:hover td{background:#f8f9fa}
   <button class="tab-btn" onclick="showTab('velocity',this)">Velocity &amp; Risk</button>
   <button class="tab-btn" onclick="showTab('kpis',this)">Program KPIs</button>
   <button class="tab-btn" onclick="showTab('flagged',this);loadFlaggedSites()">Flagged Sites</button>
+  <button class="tab-btn" onclick="showTab('depmap',this);initDependencies()">Dependencies</button>
   <button class="tab-btn" onclick="showTab('lookup',this)">Site Lookup</button>
 </div>
 
@@ -851,6 +910,57 @@ tr:hover td{background:#f8f9fa}
   </div>
 </div>
 
+<!-- DEPENDENCIES TAB -->
+<div class="tab-pane" id="tab-depmap">
+  <div class="kpi-row kpi-row-4">
+    <div class="kpi c-red"><div class="kpi-label">Switches with Dependents</div><div class="kpi-value" id="dep-kpi-count">—</div></div>
+    <div class="kpi c-orange"><div class="kpi-label">Total Dependent WCs at Risk</div><div class="kpi-value" id="dep-kpi-wcs">—</div></div>
+    <div class="kpi c-blue"><div class="kpi-label">Max Dependents (1 Switch)</div><div class="kpi-value" id="dep-kpi-max">—</div></div>
+    <div class="kpi c-purple"><div class="kpi-label">Switches with No Dependents</div><div class="kpi-value" id="dep-kpi-none">—</div></div>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:18px">
+    <div class="card">
+      <div class="card-title">Top 20 Switches by Dependent Wire Center Count</div>
+      <div id="dep-bar-chart" style="height:420px"></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Dependency Depth Distribution</div>
+      <div id="dep-donut-chart" style="height:420px"></div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">Switch Dependency Table</div>
+    <div class="filters">
+      <label>Region:</label>
+      <select id="dep-filter-region" onchange="renderDepTable()"><option value="">All Regions</option></select>
+      <label>State:</label>
+      <select id="dep-filter-state" onchange="renderDepTable()"><option value="">All States</option></select>
+      <label>Has Dependents:</label>
+      <select id="dep-filter-deps" onchange="renderDepTable()">
+        <option value="">All</option>
+        <option value="yes">Has Dependents</option>
+        <option value="no">No Dependents</option>
+      </select>
+      <input type="text" id="dep-search" placeholder="Search CLLI..." oninput="renderDepTable()" style="width:180px">
+      <span id="dep-tbl-count" style="font-size:.8rem;color:#6c757d;margin-left:auto"></span>
+    </div>
+    <div class="tbl-wrap"><table id="dep-tbl">
+      <thead><tr>
+        <th onclick="sortTable('dep-tbl',0)">CLLI</th>
+        <th onclick="sortTable('dep-tbl',1)">State</th>
+        <th onclick="sortTable('dep-tbl',2)">Region</th>
+        <th onclick="sortTable('dep-tbl',3)">Switch Type</th>
+        <th onclick="sortTable('dep-tbl',4)">% Done</th>
+        <th onclick="sortTable('dep-tbl',5)">Risk</th>
+        <th onclick="sortTable('dep-tbl',6)">Upstream Switch(es)</th>
+        <th onclick="sortTable('dep-tbl',7)"># Dependents</th>
+        <th onclick="sortTable('dep-tbl',8)">Dependent Wire Centers</th>
+      </tr></thead>
+      <tbody id="dep-tbl-body"></tbody>
+    </table></div>
+  </div>
+</div>
+
 <!-- SITE LOOKUP TAB -->
 <div class="tab-pane" id="tab-lookup">
   <div class="lookup-box">
@@ -912,6 +1022,13 @@ tr:hover td{background:#f8f9fa}
           <tbody id="lu-dev-tbl-body"></tbody>
         </table>
       </div>
+    </div>
+  </div>
+
+  <div id="lookup-dep-wrap" style="display:none;max-width:1100px;margin-top:18px">
+    <div class="card">
+      <div class="card-title">&#128257; Switch Dependencies — <span id="lookup-dep-clli-label"></span></div>
+      <div id="lookup-dep-body"></div>
     </div>
   </div>
 
@@ -1320,7 +1437,7 @@ function initWaves(){
 // ── Site Lookup ────────────────────────────────────────────────────────────────
 function lookupCLLI(clli){
   document.getElementById('lookup-input').value = clli;
-  showTab('lookup', document.querySelectorAll('.tab-btn')[8]);
+  showTab('lookup', document.querySelectorAll('.tab-btn')[9]);
   doLookup();
   window.scrollTo(0,0);
 }
@@ -1343,6 +1460,7 @@ function doLookup(){
   noneEl.style.display='none'; resEl.style.display='grid';
   loadNote(q);
   loadCircuits(q);
+  loadLookupDeps(q);
   loadLookupDevices(q);
 
   // Switch card
@@ -1696,6 +1814,140 @@ function initKPIs(){
   {responsive:true, displayModeBar:false});
 }
 
+// ── Dependencies ──────────────────────────────────────────────────────────────
+let _depInited = false;
+function initDependencies(){
+  if(_depInited) return;
+  _depInited = true;
+
+  const DS = DATA.dep_summary;
+  const DD = DATA.deps;
+  const noDepCount = DD.CLLI.filter((_,i)=>DD.DEP_COUNT[i]===0).length;
+
+  document.getElementById('dep-kpi-count').textContent = fmt(DS.switches_with_deps);
+  document.getElementById('dep-kpi-wcs').textContent   = fmt(DS.total_dep_wcs);
+  document.getElementById('dep-kpi-max').textContent   = fmt(DS.max_deps);
+  document.getElementById('dep-kpi-none').textContent  = fmt(noDepCount);
+
+  // Populate filters
+  const regions = [...new Set(DD.REGION.filter(Boolean))].sort();
+  const states  = [...new Set(DD.STATE.filter(Boolean))].sort();
+  const rSel = document.getElementById('dep-filter-region');
+  const sSel = document.getElementById('dep-filter-state');
+  regions.forEach(r=>{ const o=document.createElement('option'); o.value=r; o.textContent=r; rSel.appendChild(o); });
+  states.forEach(s=>{  const o=document.createElement('option'); o.value=s; o.textContent=s; sSel.appendChild(o); });
+
+  // Top 20 bar chart (horizontal)
+  const top20 = DD.CLLI
+    .map((c,i)=>({clli:c, cnt:DD.DEP_COUNT[i]}))
+    .filter(d=>d.cnt>0)
+    .sort((a,b)=>b.cnt-a.cnt)
+    .slice(0,20);
+  Plotly.newPlot('dep-bar-chart',[{
+    type:'bar', orientation:'h',
+    y: top20.map(d=>d.clli).reverse(),
+    x: top20.map(d=>d.cnt).reverse(),
+    marker:{color:'#dc3545'},
+    text: top20.map(d=>String(d.cnt)).reverse(),
+    textposition:'outside',
+    hovertemplate:'%{y}: %{x} dependent WCs<extra></extra>'
+  }],{
+    margin:{l:100,r:40,t:20,b:40},
+    xaxis:{title:'# Dependent Wire Centers'},
+    yaxis:{automargin:true},
+    paper_bgcolor:'transparent', plot_bgcolor:'transparent'
+  },{responsive:true, displayModeBar:false});
+
+  // Donut: dependency depth buckets
+  const buckets = {'0 (No Dependents)':0,'1-5':0,'6-10':0,'11-20':0,'21+':0};
+  DD.DEP_COUNT.forEach(n=>{
+    if(n===0)       buckets['0 (No Dependents)']++;
+    else if(n<=5)   buckets['1-5']++;
+    else if(n<=10)  buckets['6-10']++;
+    else if(n<=20)  buckets['11-20']++;
+    else            buckets['21+']++;
+  });
+  Plotly.newPlot('dep-donut-chart',[{
+    type:'pie', hole:0.45,
+    labels: Object.keys(buckets),
+    values: Object.values(buckets),
+    marker:{colors:['#adb5bd','#0d6efd','#ffc107','#fd7e14','#dc3545']},
+    textinfo:'label+value',
+    hovertemplate:'%{label}: %{value} switches<extra></extra>'
+  }],{
+    margin:{l:20,r:20,t:20,b:20},
+    showlegend:true,legend:{orientation:'h',y:-0.12},
+    paper_bgcolor:'transparent', plot_bgcolor:'transparent'
+  },{responsive:true, displayModeBar:false});
+
+  renderDepTable();
+}
+
+let _depSort = {col:7, dir:-1};
+function renderDepTable(){
+  const DD    = DATA.deps;
+  const reg   = document.getElementById('dep-filter-region').value;
+  const st    = document.getElementById('dep-filter-state').value;
+  const dFilt = document.getElementById('dep-filter-deps').value;
+  const q     = document.getElementById('dep-search').value.trim().toUpperCase();
+
+  const riskColor = {
+    'High Risk':'#dc3545','Medium Risk':'#fd7e14','Lower Risk':'#198754',
+    'No Date Set':'#6c757d','Complete':'#0d6efd'
+  };
+
+  let rows = [];
+  for(let i=0; i<DD.CLLI.length; i++){
+    if(reg   && DD.REGION[i]!==reg)  continue;
+    if(st    && DD.STATE[i]!==st)    continue;
+    if(dFilt==='yes' && DD.DEP_COUNT[i]===0)  continue;
+    if(dFilt==='no'  && DD.DEP_COUNT[i]>0)    continue;
+    if(q && !DD.CLLI[i].includes(q)) continue;
+    rows.push(i);
+  }
+
+  document.getElementById('dep-tbl-count').textContent = rows.length+' switches';
+
+  const rk = _depSort.col, rd = _depSort.dir;
+  const getVal = (idx,col) => [
+    DD.CLLI[idx], DD.STATE[idx], DD.REGION[idx], DD.SWITCH_TYPE[idx],
+    DD.PCT_DONE[idx]||0, DD.RISK[idx], DD.UPSTREAM[idx],
+    DD.DEP_COUNT[idx]||0, DD.DEP_LIST[idx]
+  ][col];
+  rows.sort((a,b)=>{
+    const va=getVal(a,rk), vb=getVal(b,rk);
+    if(va<vb) return -1*rd; if(va>vb) return 1*rd; return 0;
+  });
+
+  let html = '';
+  rows.forEach(i=>{
+    const rc = riskColor[DD.RISK[i]]||'#6c757d';
+    const depBadge = DD.DEP_COUNT[i]>0
+      ? '<span style="background:#dc3545;color:#fff;border-radius:10px;padding:1px 7px;font-size:.75rem">'+DD.DEP_COUNT[i]+'</span>'
+      : '<span style="color:#adb5bd">0</span>';
+    const depList = DD.DEP_LIST[i]
+      ? '<span style="font-size:.72rem;color:#495057">'+DD.DEP_LIST[i]+'</span>'
+      : '<span style="color:#adb5bd;font-size:.8rem">—</span>';
+    const upstream = DD.UPSTREAM[i]||'—';
+    html += '<tr onclick="lookupCLLI(this.dataset.clli)" data-clli="'+DD.CLLI[i]+'" style="cursor:pointer">'
+      +'<td><strong>'+DD.CLLI[i]+'</strong></td>'
+      +'<td>'+DD.STATE[i]+'</td>'
+      +'<td>'+DD.REGION[i]+'</td>'
+      +'<td>'+DD.SWITCH_TYPE[i]+'</td>'
+      +'<td>'+(DD.PCT_DONE[i]||0).toFixed(1)+'%</td>'
+      +'<td><span style="color:'+rc+';font-weight:600">'+DD.RISK[i]+'</span></td>'
+      +'<td style="font-size:.8rem">'+upstream+'</td>'
+      +'<td style="text-align:center">'+depBadge+'</td>'
+      +'<td>'+depList+'</td>'
+      +'</tr>';
+  });
+  document.getElementById('dep-tbl-body').innerHTML = html || '<tr><td colspan="9" style="text-align:center;color:#adb5bd;padding:20px">No matches</td></tr>';
+  document.querySelectorAll('#dep-tbl th').forEach((th,i)=>{
+    th.style.cursor='pointer';
+    th.onclick=()=>{ _depSort=(_depSort.col===i)?{col:i,dir:-_depSort.dir}:{col:i,dir:1}; renderDepTable(); };
+  });
+}
+
 // ── Flagged Sites ─────────────────────────────────────────────────────────────
 let _flaggedRows = [];
 
@@ -1818,6 +2070,52 @@ function renderFlaggedTable(){
       ? 'No notes or flags saved yet. Add them from the Site Lookup tab.'
       : 'No entries match the current filters.')
     + '</td></tr>';
+}
+
+// ── Lookup Dependencies ───────────────────────────────────────────────────────
+function loadLookupDeps(clli){
+  const DD   = DATA.deps;
+  const wrap = document.getElementById('lookup-dep-wrap');
+  const idx  = DD.CLLI.indexOf(clli);
+  if(idx === -1){ wrap.style.display='none'; return; }
+
+  document.getElementById('lookup-dep-clli-label').textContent = clli;
+  wrap.style.display = 'block';
+
+  const upstream = DD.UPSTREAM[idx] || '—';
+  const depCount = DD.DEP_COUNT[idx] || 0;
+  const depList  = DD.DEP_LIST[idx]  || '';
+
+  let html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">';
+
+  // Upstream panel
+  html += '<div><div style="font-weight:700;font-size:.85rem;color:#495057;margin-bottom:6px">Upstream Switch(es)</div>';
+  if(upstream === '—'){
+    html += '<div style="color:#adb5bd;font-size:.85rem">No upstream dependency recorded</div>';
+  } else {
+    upstream.split(',').map(s=>s.trim()).forEach(sw=>{
+      html += '<span style="display:inline-block;background:#e3f2fd;color:#0d6efd;border-radius:4px;padding:3px 10px;margin:2px;font-size:.82rem;font-weight:600;cursor:pointer" onclick="lookupCLLI(\''+sw+'\')">'+sw+'</span>';
+    });
+    html += '<div style="font-size:.75rem;color:#6c757d;margin-top:4px">Click to look up any upstream switch</div>';
+  }
+  html += '</div>';
+
+  // Dependents panel
+  html += '<div><div style="font-weight:700;font-size:.85rem;color:#495057;margin-bottom:6px">Wire Centers Depending on This Switch <span style="background:#dc3545;color:#fff;border-radius:10px;padding:1px 8px;font-size:.75rem;margin-left:4px">'+depCount+'</span></div>';
+  if(depCount === 0){
+    html += '<div style="color:#adb5bd;font-size:.85rem">No wire centers route through this switch</div>';
+  } else {
+    depList.split(',').map(s=>s.trim()).forEach(wc=>{
+      const isDecom = DATA.deps.CLLI.includes(wc);
+      const bg = isDecom ? '#fff3cd' : '#f8f9fa';
+      const co = isDecom ? '#856404' : '#495057';
+      html += '<span style="display:inline-block;background:'+bg+';color:'+co+';border-radius:4px;padding:3px 10px;margin:2px;font-size:.82rem;font-weight:600'+(isDecom?';cursor:pointer\' onclick=\'lookupCLLI("'+wc+'")\'' :'\'')+'">'+wc+(isDecom?' &#9888;':'')+'</span>';
+    });
+    html += '<div style="font-size:.75rem;color:#6c757d;margin-top:6px">&#9888; = also a decom switch &nbsp;|&nbsp; These WCs must be rehomed before this switch can be decommissioned</div>';
+  }
+  html += '</div></div>';
+
+  document.getElementById('lookup-dep-body').innerHTML = html;
 }
 
 // ── Lookup Device Inventory ───────────────────────────────────────────────────
