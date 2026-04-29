@@ -1,0 +1,27 @@
+# Credentials — NEVER commit
+.env
+
+# Generated dashboard outputs (large binary HTML files)
+switch_decom_dashboard.html
+ebh_dashboard.html
+sqdb_dashboard.html
+*.html
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter / IPython
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Data files (may contain PII)
+*.xlsx
+*.csv
+*.xls
